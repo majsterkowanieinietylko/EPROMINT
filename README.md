@@ -21,4 +21,5 @@ This package includes everything you need to make your own <b>EPROMINT CPU</b>. 
 - Codes for generating memory maps for each board
 - Already generated memory maps
 - Software for generating memory maps
+- Numeric display project for debugging the CPU
 - Assembled sample programs for the CPU and the demo used in YT video
