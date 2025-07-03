@@ -1,0 +1,531 @@
+<!-- 
+    Memory map generator software (V1.0) written by MINT: https://www.youtube.com/@__MINT_
+    Allows to convert almost any parallel memory into FPGA-like device that can perform simple
+    tasks in hardware, such as mathematical operations, SPI / UART driving, PWM regulation, etc.
+    This software comes with absolutely no warranty!
+-->
+
+<!DOCTYPE html>
+<html lang="pl-PL">
+<head>
+<title>UV-EPROM PLD</title>
+<meta charset="UTF-8">
+<link rel="shortcut icon" href="ic.jpg">
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>  <!-- zip library to estimate created logic complexity -->
+<script type="text/javascript">
+
+
+function id(what) {
+    return document.getElementById(what);
+}
+
+function run() {  // program entry function
+    let binaryFile;
+    let generated = false;
+    id("convert").addEventListener("mouseenter", function() {
+        this.style.boxShadow = "rgb(185 185 185) 0px 0px 16px 0px";
+    });
+    id("convert").addEventListener("mouseleave", function() {
+        this.style.boxShadow = "none";
+    });
+    id("save").addEventListener("mouseenter", function() {
+        this.style.boxShadow = "rgb(185 185 185) 0px 0px 16px 0px";
+    });
+    id("save").addEventListener("mouseleave", function() {
+        this.style.boxShadow = "none";
+    });
+    id("convert").addEventListener("click", function() {
+        let result = evaluateExpressions(id("expr").value);  // main input processing function
+        binaryFile = result.binary;  // generated memory map
+        if(result.message == "") {   // no errors during processing
+            id("save").style.opacity = "1";
+            id("save").style.pointerEvents = "all";
+            generated = true;
+        }
+        else {  // an error occurred
+            id("save").style.pointerEvents = "none";
+            id("save").style.opacity = "0.4";
+            log("Error: " + result.message);
+            generated = false;
+        }
+    });
+    id("save").addEventListener("click", function() {
+        if(!generated) {
+            return;
+        }
+        saveGenerated(binaryFile);  // download of generated file
+    });
+    id("expr").addEventListener("keydown", function(event) {  // text editor special key handler
+        switch(event.key) {
+            case "Enter":
+                if(event.cancelable) {
+                    event.preventDefault();
+                }
+                handleEnter(event);
+            break;
+            case "Tab":
+                if(event.cancelable) {
+                    event.preventDefault();
+                }
+                handleTab(event);
+            break;
+            case "s":
+                if(event.ctrlKey) {
+                    if(event.cancelable) {
+                        event.preventDefault();
+                    }
+                    handleSave(event);
+                }
+            break;
+        }
+    });
+    id("expr").addEventListener("input", function(event) {  // paste event handler
+        if(event.inputType == "insertFromPaste") {
+            let pasted = id("expr").value;
+            pasted = pasted.replace(/\t/gm, "    ");  // replace Tab with spaces
+            pasted = pasted.replace(/\r/gm, "");  // remove \r (carriage return)
+            id("expr").value = pasted;
+        }
+    });
+    let prevSession;
+    let fail = false;
+    try {
+        prevSession = localStorage.getItem("UV_EPROM_logic_expr");  // load previous session from localStorage
+        fail = (prevSession === null);
+    }
+    catch(err) {
+        fail = true;
+    }
+    if(!fail) {
+        id("expr").value = prevSession;
+    }
+    else {
+        id("expr").value = 'D[7:0] = A[7:0] + A[15:8];\n';  // if previous session not available, load example code
+    }
+    log("Ready.");
+}
+
+function handleTab(event) {   // Tab handler to support indentation
+
+    const written = id("expr").value;
+    const selStart = id("expr").selectionStart;
+    const selEnd = id("expr").selectionEnd;
+    
+    const selLineStart = written.lastIndexOf("\n", selStart - 1) + 1;  // position at the start of first selected line
+    const nextNewLine = written.indexOf("\n", selEnd);   // search for next line break
+    const selLineEnd = (nextNewLine == -1) ? written.length : nextNewLine;   // position at the end of last selected line
+    const selected = written.substring(selLineStart, selLineEnd);   // lines included in selected text
+
+    if(event.shiftKey) {
+        let lines = selected.split("\n");
+        for(let i=0; i<lines.length; i++) {
+            if(lines[i].startsWith("    ")) {
+                lines[i] = lines[i].substring(4);  // reverse indentation
+            }
+        }
+        const reversedIndent = lines.join("\n");
+        const lenDiff = selected.length - reversedIndent.length;
+        id("expr").value = written.substring(0, selLineStart) + reversedIndent + written.substring(selLineEnd);  // write back modified text
+        id("expr").selectionStart = (lines.length == 1) ? selStart - 4 : selLineStart;  // update cursor position
+        id("expr").selectionEnd = selEnd - lenDiff;
+    }
+    else {
+        let lines = selected.split("\n");
+        let allEmpty = true;
+        for(let line of lines) {
+            if(line != "") {
+                allEmpty = false;
+                break;
+            }
+        }
+        for(let i=0; i<lines.length; i++) {
+            if(lines[i] != "" || allEmpty) {
+                lines[i] = "    " + lines[i];  // add indentation
+            }
+        }
+        const addedIndentation = lines.join("\n");
+        const lenDiff = addedIndentation.length - selected.length;
+        id("expr").value = written.substring(0, selLineStart) + addedIndentation + written.substring(selLineEnd);  // write back modified text
+        id("expr").selectionStart = (lines.length == 1) ? selStart + 4 : selLineStart;  // update cursor position
+        id("expr").selectionEnd = selEnd + lenDiff;
+    }
+}
+
+function handleEnter(event) {   // Enter handler to support automatic indentation & bracket closing
+    const selStart = id("expr").selectionStart;
+    const selEnd = id("expr").selectionEnd;
+    const written = id("expr").value;
+    const lineStart = written.lastIndexOf("\n", selStart - 1) + 1;  // position after line break from previous line
+    const currentLine = written.substring(lineStart, selStart);  // portion of text from current line start to cursor position
+    let indent = currentLine.match(/^\s*/)[0] || "";   // indentation from current line
+    let offset = indent.length;
+    if(currentLine.trim().endsWith("{")) {  // increase indentation & close the bracket
+        indent += `    \n${indent}}`;
+        offset += 4;
+    }
+    id("expr").value = written.substring(0, selStart) + "\n" + indent + written.substring(selEnd);  // insert Enter and indent
+    id("expr").selectionStart = id("expr").selectionEnd = selStart + offset + 1;  // move cursor to next line
+}
+
+function handleSave(event) {   // Ctrl+s handler to save current file to localStorage
+    const written = id("expr").value;
+    try {
+        localStorage.setItem("UV_EPROM_logic_expr", written);
+    } 
+    catch(err) {
+        log("Unable to save.");
+        return;
+    }
+    log("Saved!");
+}
+
+function evaluateExpressions(rawText) {  // text parsing & memory map generating function
+    const util = {  // structure that will be a bridge between code written by user and this function (evaluateExpressions)
+        dataBusVal: 0,
+        addressBusVal: 0,
+        wasDataKnown: 0,
+        isDataBusKnown: [],
+        addressBus,
+        getDataBus,
+        setDataBus
+    };
+
+    let memContents = new Uint8Array(2137).fill(69);  // initial memory map buffer
+
+    let parseResult = insertFunctions(rawText);  // replace A[...] and D[...] with addressBus(), getDataBus() and setDataBus()
+    if(parseResult.message != "") {  // an error occurred
+        return {binary: memContents, message: parseResult.message};
+    }
+    
+    if(parseResult.widthA == 0) {
+        return {binary: memContents, message: "address bus usage not specified."};
+    }
+    if(parseResult.widthD == 0) {
+        return {binary: memContents, message: "data bus usage not specified."};
+    }
+    
+    let addresses = Math.pow(2, parseResult.widthA);  // required memory addresses
+    let logString = "";
+    if(parseResult.widthA > 24) {  // 16M addresses exceeded
+        logString += `Warning: excessive address bus width (${parseResult.widthA}), limited to 24.\n`;
+        addresses = Math.pow(2, 24);
+    }
+    if(parseResult.widthD > 16) {  // too wide data bus
+        logString += `Warning: excessive data bus width (${parseResult.widthD}), limited to 16.\n`;
+    }
+    
+    let parsedText = parseResult.processed;  // user code with inserted functions
+    let processInput;
+    try {
+        processInput = new Function(`{${Object.keys(util).join(", ")}}`, parsedText);  // create a function from user code
+    }
+    catch(err) {  // failed to create function handler
+        console.log(err);
+        return {binary: memContents, message: err.message};
+    }
+    
+    let startLine = getLineOffset(parsedText, processInput);  // line at which user code starts inside generated function
+    let data16mode = (parseResult.widthD > 8);  // 16-bit data bus mode
+    let memBytes = data16mode ? addresses * 2 : addresses;  // required memory bytes
+    memContents = new Uint8Array(memBytes).fill(0xFF);  // memory map buffer
+    
+    for(util.addressBusVal=0; util.addressBusVal<addresses; util.addressBusVal++) {  // loop through all possible addresses
+        util.dataBusVal = 0;  // initial data bus value
+        util.isDataBusKnown = new Array(16).fill(false);  // flags telling whether data was assigned to particular data bus line
+        for(let j=0; j<16; j++) {   // loop trying to determine expression values that were dependent on not yet evaluated expressions
+            util.wasDataKnown = true;
+            
+            try {
+                processInput(util);  // call user code
+            }
+            catch(err) {  // execution failed
+                markError(err.stack, rawText, startLine);
+                return {binary: memContents, message: err.message};
+            }
+            
+            if(util.wasDataKnown) {  // check whether all referenced data was known during execution
+                break;
+            }
+            if(j == 15) {  // failed to determine some value(s), most likely caused by referencing a value of unassinged data bus line
+                return {binary: memContents, message: "unable to determine expression value."};
+            }
+            /*  in case there is something like "D[1] = D[0]; D[0] = A[0]", D[0] is unknown during first iteration, and operation "D[1] = D[0];"
+                results in util.wasDataKnown flag reset. D[0] is known after executing "D[0] = A[0]", and only after that D[1] can be set to value
+                of D[0], so second iteration with the same address is needed. Such iterative approach works for simple case like the one above,
+                but might fail with more complex ones while there is no indication of undetermined data. So value assignment after value reference
+                is not recommended. It produces errors in most programming languages anyways.
+            */
+        }
+        if(data16mode) {  // 16-bit data bus, little-endian order
+            memContents[util.addressBusVal * 2] = util.dataBusVal & 0xFF;
+            memContents[util.addressBusVal * 2 + 1] = util.dataBusVal >> 8;
+            continue;
+        }
+        memContents[util.addressBusVal] = util.dataBusVal;  // 8-bit data bus
+    }
+    logString += `Target data bus width: ${data16mode ? "16-bit" : "8-bit"}\n`;
+    logString += `Used memory space: ${formatSize(memBytes)}\n`;
+    const entropy = getEntropy(memContents);  // estimate created logic complexity by calculating its entropy
+    if(entropy == -1) {  // getEntropy function failed
+        logString += "Could not estimate resource usage, check internet connection\n";
+    }
+    else {
+        logString += `Estimated logic resources usage: ${entropy.toPrecision(3).substr(0, 4)}%\n`;
+    }
+    logString += "Success!";
+    log(logString);
+    return {binary: memContents, message: ""};
+    
+    function addressBus(bitSelect) {  // get value of selected address bus slice
+        clampValues(bitSelect, 23);
+        return sliceValue(bitSelect, util.addressBusVal);
+    }
+    
+    function getDataBus(bitSelect) {  // get value of selected data bus slice
+        clampValues(bitSelect, 15);
+        for(let sel of bitSelect) {
+            if(!util.isDataBusKnown[sel]) {  // attempt to get value of not yet assigned data bus line, reset util.wasDataKnown flag
+                //console.log("Reference to line", sel);
+                util.wasDataKnown = false;
+                return NaN;
+            }
+        }
+        return sliceValue(bitSelect, util.dataBusVal);
+    }
+    
+    function setDataBus(bitSelect, busVal) {  // write value into selected data bus slice
+        if(isNaN(busVal)) {  // attempt to write undetermined value into the data bus, reset util.wasDataKnown flag
+            util.wasDataKnown = false;
+            //console.log("writing value", busVal);
+            return;
+        }
+        clampValues(bitSelect, 15);
+        for(let sel of bitSelect) {
+            util.isDataBusKnown[sel] = true;
+        }
+        util.dataBusVal = writeSlice(bitSelect, busVal, util.dataBusVal);
+    }
+    
+    function clampValues(bitSelect, limit) {  // clamp input values & round them
+        for(let i=0; i<bitSelect.length; i++) {
+            bitSelect[i] = Math.round(Math.max(Math.min(bitSelect[i], limit), 0));
+        }
+    }
+    
+    function formatSize(byteSize) {  // file size string formatter
+        const suffixes = ["B", "KB", "MB"];
+        for(let i=2; i>=0; i--) {
+            let divided = Math.floor(byteSize / Math.pow(2, i * 10));
+            if(divided > 0) {
+                return divided + suffixes[i];
+            }
+        }
+        return "0B";
+    }
+}
+
+function sliceValue(bitSelect, fullValue) {  // form a value from selected bits in a provided value
+    let sliced = 0;
+    for(let sel of bitSelect) {
+        sliced <<= 1;
+        sliced |= (fullValue >> sel) & 1;
+    }
+    return sliced;
+}
+
+function writeSlice(bitSelect, toWrite, originalVal) {  // write a value into selected bits in a provided value
+    let bitAt = bitSelect.length - 1;
+    for(let sel of bitSelect) {
+        originalVal &= ~(1 << sel);
+        originalVal |= ((toWrite >> bitAt--) & 1) << sel;
+    }
+    return originalVal;
+}
+
+function insertFunctions(rawText) {  // process raw user code
+    const lineRanges = [/(?:(?<=\[))\s*(\d+)\s*:\s*(\d+)\s*(?:(?=\]))/g, /(\d+):(\d+)/g];  // [(sp)[number](sp):(sp)[number](sp)], [number]:[number]
+    const addrLineList = /(?:(?<!\w)|^)A\[([^\]]+)\]/g;  // A[...]
+    const dataLineListRead = /(?:(?<!\w)|^)D\[([^\]]+)\]/g;  // x = D[...]
+    const dataLineListWrite = /(?:(?<!\w)|^)D\[([^\]]+)\]\s*=(?!=)\s*([^\;]*)/g;  // D[...] = x
+    const general = /(?:(?<!\w)|^)[DA]\s*\[[^\]]*\]/g;  // D[...] / A[...]
+    const original = rawText;
+    let addressRange = 0;
+    let dataRange = 0;
+    
+    for(let rangeType of lineRanges) {
+        rawText = rawText.replace(rangeType, function(_, start, stop, assigned) {  // replace ranges with lists (eg. 3:0 -> 3, 2, 1, 0)
+            start = Math.min(1000, Math.max(0, parseInt(start)));
+            stop = Math.min(1000, Math.max(0, parseInt(stop)));
+            let list = "";
+            if(start <= stop) {
+                for(let i=start; i<stop; i++) {
+                    list += i + ", ";
+                }
+            }
+            else {
+                for(let i=start; i>stop; i--) {
+                    list += i + ", ";
+                }
+            }
+            list += stop;
+            return list;
+        });
+    }
+    
+    rawText = rawText.replace(dataLineListWrite, function(_, list, assigned) {  // replace D[...] = x with setDataBus(..., x)
+        updateDataRange(getList(list));
+        return `setDataBus([${list}], ${assigned})`;
+    });
+    rawText = rawText.replace(dataLineListRead, function(_, list) {  // replace x = D[...] with x = getDataBus(...)
+        updateDataRange(getList(list));
+        return `getDataBus([${list}])`;
+    });
+    rawText = rawText.replace(addrLineList, function(_, list) {  // replace A[...] with addressBus(...)
+        updateAddressRange(getList(list));
+        return `addressBus([${list}])`;
+    });
+    
+    let errMess = "";
+    const matched = general.exec(rawText);
+    if(matched) {  // some text matching D[...] / A[...] was not replaced and thus is invalid
+        const lines = rawText.split("\n");
+        const pos = matched.index;
+        let lenSum = 0;
+        let lineAt = 0;
+        for(let line of lines) {
+            lenSum += line.length + 1;
+            if(lenSum > pos) {  // line with error reached
+                break;
+            }
+            lineAt++;
+        }
+        markError("\n<anonymous>:" + lineAt, original, 0);  // mark invalid line
+        errMess = "invalid syntax: " + matched[0];
+    }
+    
+    //console.log(rawText);
+    console.log("Top address line:", addressRange);
+    console.log("Top data line:", dataRange);
+    return {processed: rawText, widthA: addressRange, widthD: dataRange, message: errMess};
+    
+    function updateDataRange(indexList) {  // update data line count
+        for(let i of indexList) {
+            dataRange = Math.max(dataRange, i + 1);
+        }
+    }
+    
+    function updateAddressRange(indexList) {  // update address line count
+        for(let i of indexList) {
+            addressRange = Math.max(addressRange, i + 1);
+        }
+    }
+    
+    function getList(listString) {  // form an array from list string
+        let raw = listString.split(",");
+        for(let i=0; i<raw.length; i++) {
+            const val = parseInt(raw[i]);
+            raw[i] = Number.isInteger(val) ? val : -1;
+        }
+        return raw;
+    }
+}
+
+function getLineOffset(inputExpr, genFunction) {  // get line at which user code starts in generated function
+    let firstLine = (inputExpr.split("\n"))[0];
+    let functionLines = genFunction.toString().split("\n");
+    for(let i=0; i<functionLines.length; i++) {
+        if(functionLines[i] == firstLine) {
+            return i + 1;
+        }
+    }
+    return -1;
+}
+
+function markError(errorMess, actualText, lineOffset) {  // mark line of code at which error occurred
+    if(lineOffset == -1) {
+        return;
+    }
+    const lines = actualText.split("\n");
+    const tracebackPattern = /<anonymous>:(\d+)/;
+    if (typeof(errorMess) != "string") return;
+    const checkLine = (errorMess.split("\n"))[1].trim();
+    const found = checkLine.match(tracebackPattern);  // extract line position from error message
+    if(found) {
+        let line = parseInt(found[1]) - lineOffset;  // subtract lines added in created function handler
+        if(line < 0) {
+            return;
+        }
+        let lenSum = 0;
+        for(let i=0; i<line; i++) {  // get length of text before invalid line
+            lenSum += (lines[i]).length + 1;
+        }
+        id("expr").focus();
+        id("expr").setSelectionRange(lenSum, lenSum + lines[line].length);  // select the whole line
+        //id("expr").scrollTop = id("expr").scrollHeight;
+    }
+}
+
+function getEntropy(binary) {  // measure file entropy
+    try {
+        const compressed = pako.deflate(binary);  // compress input file into zip
+        const result = Math.min((compressed.length / binary.length), 1);  // check compressed size to original size ratio
+        return result * 100;
+    }
+    catch(err) {
+        return -1;
+    }
+}
+
+function saveGenerated(binFile) {  // download generated memory map
+    const EPROMdata = new Blob([binFile], {type: "binary"});
+    const downlURL = URL.createObjectURL(EPROMdata);
+    id("dummy").setAttribute("download", "UV_EPROM_logic.bin");
+    id("dummy").setAttribute("href", downlURL);
+    id("dummy").click();
+}
+
+function log(text) {  // print a text message
+    id("mess").value = text;
+    id("mess").scrollTop = id("mess").scrollHeight;  // scroll to latest message
+}
+
+
+</script>
+
+</head>
+
+<style>
+
+.inp {
+     height:26px;
+     margin-top:540px;
+     display:inline-block;
+     border:3px solid white;
+     border-radius:2px;
+     color:white;
+     font-family:Verdana;
+     font-size:24px;
+     padding:5px;
+     text-align:center;
+     background-color:#111;
+     cursor:pointer;
+     outline:none
+}
+
+</style>
+
+<body onload="run()" style='background-color:#333; background-image:url("bg.png"); position:relative; text-align:center; user-select:none; pointer-events:all'>
+<h1 style="color:white; font-family:Verdana; font-size:40px; margin-top:30px; margin-bottom:40px; display:inline-block">Convert your UV-EPROM into vintage FPGA</h1>
+<br/>
+<div id="cont" style="position:relative; text-align:center; opacity:1; transition:0.3s opacity">
+<textarea id="expr" spellcheck="false" style="width:1050px; height:500px; position:absolute; color:white; font-size:19px; font-family:monospace; background-color:#222; border:3px solid white; border-radius:4px; display:inline-block; outline:none; resize:none; margin-left:-540px; padding:7px"></textarea>
+<br/>
+<textarea id="mess" spellcheck="false" style="width:600px; height:80px; position:absolute; color:white; font-size:16px; font-family:monospace; background-color:#222; border:3px solid white; border-radius:4px; display:inline-block; outline:none; resize:none; margin-left:-503px; margin-top:540px; padding:3px" readonly></textarea>
+<input id="convert" type="button" class="inp" style="width:140px; padding:0px !important; height:38px; position:absolute; margin-left:160px; font-size:20px; opacity:1; transition:0.3s; pointer-events:inherit;" value="Generate!"/>
+<input id="save" type="button" class="inp" style="width:150px; padding:0px !important; height:38px; position:absolute; margin-left:340px; font-size:20px; opacity:0.4; transition:0.3s; pointer-events:none;" value="Download"/>
+<a id="dummy" download="" href="" style="display: none"></a>
+
+</div>
+</body>
+</html>
